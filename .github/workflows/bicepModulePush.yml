@@ -1,0 +1,162 @@
+name: Publish Bicep Modules
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'modules/**'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [bicep-module-push]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  MODULE_DIR: modules
+  BICEP_PUBLISH_FORCE: "false"
+
+jobs:
+  publish-changed-modules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve ACR login server
+        id: acr
+        run: |
+          set -euo pipefail
+          if [[ -z "${ACR_NAME}" ]]; then
+            echo "ACR_NAME secret is not set." >&2
+            exit 1
+          fi
+          login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          echo "login_server=$login_server" >> "$GITHUB_OUTPUT"
+
+      - name: Detect changed Bicep files
+        id: changed
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            raw_files_json='${{ toJson(github.event.client_payload.files) }}'
+            if [[ -z "$raw_files_json" || "$raw_files_json" == "null" ]]; then
+              echo "No files provided in repository_dispatch payload." >&2
+              echo "count=0" >> "$GITHUB_OUTPUT"
+              echo "files=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            mapfile -t changed_files < <(printf '%s\n' "$raw_files_json" | jq -r '.[]?' | sed 's/^\s*//;s/\s*$//')
+            echo "Dispatch files:" 
+            printf '  - %s\n' "${changed_files[@]}"
+            mapfile -t resource_names < <(
+              printf '%s\n' "${changed_files[@]}" \
+                | awk -F'/' '/^resources\//{print $2}' \
+                | tr '[:upper:]' '[:lower:]' \
+                | sort -u
+            )
+            echo "Derived resource names:"
+            printf '  - %s\n' "${resource_names[@]}"
+
+            affected_modules=()
+            for resource in "${resource_names[@]}"; do
+              if [[ -z "$resource" ]]; then
+                continue
+              fi
+              mapfile -t hits < <(grep -R -l -i -F "/${resource}" "${MODULE_DIR}" --include '*.bicep' || true)
+              if [[ ${#hits[@]} -gt 0 ]]; then
+                echo "Matches for ${resource}:"
+                printf '  - %s\n' "${hits[@]}"
+                affected_modules+=("${hits[@]}")
+              fi
+            done
+
+            if [[ ${#affected_modules[@]} -gt 0 ]]; then
+              changed_files+=("${affected_modules[@]}")
+            fi
+          else
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              base_sha="${{ github.event.before }}"
+              head_sha="${{ github.sha }}"
+            else
+              head_sha=$(git rev-parse HEAD)
+              base_sha=$(git rev-parse HEAD~1)
+            fi
+
+            if [[ -z "$base_sha" ]] || ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+              base_sha=$(git rev-list --max-parents=0 HEAD)
+            fi
+
+            mapfile -t changed_files < <(git diff --name-only "$base_sha" "$head_sha" -- "${MODULE_DIR}/**/*.bicep")
+          fi
+
+          mapfile -t changed_files < <(printf '%s\n' "${changed_files[@]}" | sort -u)
+          if [[ ${#changed_files[@]} -eq 0 ]]; then
+            echo "No Bicep changes detected under ${MODULE_DIR}/."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "files=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "${changed_files[@]}" > changed_bicep_files.txt
+          echo "count=${#changed_files[@]}" >> "$GITHUB_OUTPUT"
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          cat changed_bicep_files.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Publish changed Bicep modules
+        if: steps.changed.outputs.count != '0'
+        env:
+          ACR_LOGIN_SERVER: ${{ steps.acr.outputs.login_server }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          set -euo pipefail
+
+          force_flag=""
+          if [[ "${BICEP_PUBLISH_FORCE}" == "true" ]]; then
+            force_flag="--force"
+          fi
+
+          while IFS= read -r file; do
+            if [[ -z "$file" || ! -f "$file" ]]; then
+              continue
+            fi
+
+            IFS='/' read -r -a parts <<< "$file"
+            if [[ ${#parts[@]} -lt 4 ]]; then
+              echo "Skipping $file. Expected path ${MODULE_DIR}/<module>/<version>/<file>.bicep" >&2
+              continue
+            fi
+
+            version="${parts[-2]}"
+            module_path=$(printf "%s/" "${parts[@]:1:${#parts[@]}-3}")
+            module_path="${module_path%/}"
+            module_path="${MODULE_DIR}/${module_path}"
+            module_path=$(echo "$module_path" | tr '[:upper:]' '[:lower:]')
+
+            target="br:${ACR_LOGIN_SERVER}/${module_path}:${version}"
+            echo "Publishing $file to $target"
+            az bicep publish --file "$file" --target "$target" $force_flag
+
+            latest_target="br:${ACR_LOGIN_SERVER}/${module_path}:latest"
+            echo "Publishing $file to $latest_target"
+            az bicep publish --file "$file" --target "$latest_target" $force_flag
+          done <<< "$CHANGED_FILES"
+
+
