@@ -65,30 +65,49 @@ jobs:
             mapfile -t changed_files < <(printf '%s\n' "$raw_files_json" | jq -r '.[]?' | sed 's/^\s*//;s/\s*$//')
             echo "Dispatch files:" 
             printf '  - %s\n' "${changed_files[@]}"
-            mapfile -t resource_names < <(
-              printf '%s\n' "${changed_files[@]}" \
-                | awk -F'/' '/^resources\//{print $2}' \
-                | tr '[:upper:]' '[:lower:]' \
-                | sort -u
-            )
-            echo "Derived resource names:"
-            printf '  - %s\n' "${resource_names[@]}"
-
-            affected_modules=()
-            for resource in "${resource_names[@]}"; do
-              if [[ -z "$resource" ]]; then
+            declare -A resource_versions
+            while IFS= read -r file; do
+              if [[ "$file" != resources/* ]]; then
                 continue
               fi
-              mapfile -t hits < <(grep -R -l -i -F "/${resource}" "${MODULE_DIR}" --include '*.bicep' || true)
-              if [[ ${#hits[@]} -gt 0 ]]; then
-                echo "Matches for ${resource}:"
-                printf '  - %s\n' "${hits[@]}"
-                affected_modules+=("${hits[@]}")
+              IFS='/' read -r _ resource version _ <<< "$file"
+              if [[ -n "$resource" && -n "$version" ]]; then
+                resource=$(echo "$resource" | tr '[:upper:]' '[:lower:]')
+                version=$(echo "$version" | tr '[:upper:]' '[:lower:]')
+                resource_versions["$resource"]="$version"
               fi
+            done < <(printf '%s\n' "${changed_files[@]}")
+
+            echo "Derived resource versions:"
+            for resource in "${!resource_versions[@]}"; do
+              echo "  - ${resource}:${resource_versions[$resource]}"
             done
 
-            if [[ ${#affected_modules[@]} -gt 0 ]]; then
-              changed_files+=("${affected_modules[@]}")
+            declare -A affected_set
+            for resource in "${!resource_versions[@]}"; do
+              version="${resource_versions[$resource]}"
+              mapfile -t candidates < <(grep -R -l -i "resources/${resource}:" "${MODULE_DIR}" --include '*.bicep' || true)
+              for candidate in "${candidates[@]}"; do
+                mapfile -t tags < <(
+                  grep -o -i "resources/${resource}:[^'\" ]\+" "$candidate" \
+                    | awk -F: '{print $NF}' \
+                    | tr '[:upper:]' '[:lower:]' \
+                    | sort -u
+                )
+                for tag in "${tags[@]}"; do
+                  if [[ "$tag" == "latest" || "$tag" == "$version" ]]; then
+                    echo "Matched ${resource}:${tag} in ${candidate}"
+                    affected_set["$candidate"]=1
+                    break
+                  fi
+                done
+              done
+            done
+
+            if [[ ${#affected_set[@]} -gt 0 ]]; then
+              for file in "${!affected_set[@]}"; do
+                changed_files+=("$file")
+              done
             fi
           else
             if [[ "${{ github.event_name }}" == "push" ]]; then
